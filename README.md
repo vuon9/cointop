@@ -73,6 +73,7 @@ In action
 - Auto-refresh
 - Works on macOS, Linux, and Windows
 - It's very lightweight; can be left running indefinitely
+- Codespaces tested.
 
 ## Installing
 
