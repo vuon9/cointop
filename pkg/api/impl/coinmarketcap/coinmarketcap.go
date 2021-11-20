@@ -28,7 +28,8 @@ var ErrFetchGraphData = errors.New("graph data fetch error")
 
 // Service service
 type Service struct {
-	client *cmc.Client
+	client    *cmc.Client
+	rateLimit uint8
 }
 
 // NewCMC new service
@@ -40,7 +41,8 @@ func NewCMC(apiKey string) *Service {
 		ProAPIKey: apiKey,
 	})
 	return &Service{
-		client: client,
+		client:    client,
+		rateLimit: 30,
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 )
 
 func (ct *Cointop) initlog() {
-	filename := "/tmp/cointop.log"
+	filename := "./tmp/cointop.log"
 	debugFile := os.Getenv("DEBUG_FILE")
 	if debugFile != "" {
 		filename = pathutil.NormalizePath(debugFile)

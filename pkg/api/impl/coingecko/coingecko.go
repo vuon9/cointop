@@ -1,6 +1,7 @@
 package coingecko
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	apitypes "github.com/cointop-sh/cointop/pkg/api/types"
 	"github.com/cointop-sh/cointop/pkg/api/util"
@@ -22,19 +25,48 @@ var ErrPingFailed = errors.New("failed to ping")
 // ErrNotFound is the error when the target is not found
 var ErrNotFound = errors.New("not found")
 
+var ErrRateLimited = errors.New("rate limited")
+
 // Config config
 type Config struct {
 	PerPage  uint
 	MaxPages uint
 }
 
+type clientRateLimiters struct {
+	CoinsList          *rate.Limiter
+	CoinsMarket        *rate.Limiter
+	Ping               *rate.Limiter
+	CoinsIDMarketChart *rate.Limiter
+	ExchangeRates      *rate.Limiter
+	GlobalCharts       *rate.Limiter
+	Global             *rate.Limiter
+	SimplePrice        *rate.Limiter
+}
+
+const defaultRateLimit = 50
+
 // Service service
 type Service struct {
-	client            *gecko.Client
-	maxResultsPerPage uint
-	maxPages          uint
-	cacheMap          sync.Map
-	cachedRates       *types.ExchangeRatesItem
+	client             *gecko.Client
+	maxResultsPerPage  uint
+	maxPages           uint
+	clientRateLimiters *clientRateLimiters
+	cacheMap           sync.Map
+	cachedRates        *types.ExchangeRatesItem
+}
+
+func isInQuota(l *rate.Limiter) error {
+	err := l.Wait(context.Background())
+	if err != nil {
+		return err
+	}
+
+	if !l.Allow() {
+		return ErrRateLimited
+	}
+
+	return nil
 }
 
 // NewCoinGecko new service
@@ -58,6 +90,16 @@ func NewCoinGecko(config *Config) *Service {
 		maxResultsPerPage: uint(math.Min(float64(maxResults), float64(maxResultsPerPage))),
 		maxPages:          maxPages,
 		cacheMap:          sync.Map{},
+		clientRateLimiters: &clientRateLimiters{
+			CoinsList:          rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+			CoinsMarket:        rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+			Ping:               rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+			CoinsIDMarketChart: rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+			ExchangeRates:      rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+			GlobalCharts:       rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+			Global:             rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+			SimplePrice:        rate.NewLimiter(rate.Limit(60*time.Second), defaultRateLimit),
+		},
 	}
 	svc.cacheCoinsIDList()
 	return svc
@@ -65,6 +107,11 @@ func NewCoinGecko(config *Config) *Service {
 
 // Ping ping API
 func (s *Service) Ping() error {
+	err := isInQuota(s.clientRateLimiters.Ping)
+	if err != nil {
+		return err
+	}
+
 	if _, err := s.client.Ping(); err != nil {
 		return err
 	}
@@ -78,10 +125,6 @@ func (s *Service) GetAllCoinData(convert string, ch chan []apitypes.Coin) error 
 		defer close(ch)
 
 		for i := 0; i < int(s.maxPages); i++ {
-			if i > 0 {
-				time.Sleep(1 * time.Second)
-			}
-
 			coins, err := s.getPaginatedCoinData(convert, i, []string{})
 			if err != nil {
 				return
@@ -118,6 +161,12 @@ func (s *Service) GetCoinDataBatch(names []string, convert string) ([]apitypes.C
 func (s *Service) GetCoinGraphData(convert, symbol, name string, start, end int64) (apitypes.CoinGraph, error) {
 	ret := apitypes.CoinGraph{}
 	days := strconv.Itoa(util.CalcDays(start, end))
+
+	err := isInQuota(s.clientRateLimiters.CoinsIDMarketChart)
+	if err != nil {
+		return ret, err
+	}
+
 	chart, err := s.client.CoinsIDMarketChart(s.coinNameToID(name), convert, days)
 	if err != nil {
 		return ret, err
@@ -151,6 +200,11 @@ func (s *Service) GetCoinGraphData(convert, symbol, name string, start, end int6
 // GetExchangeRates returns the exchange rates from the backend, or a cached copy if requested and available
 func (s *Service) GetExchangeRates(cached bool) (*types.ExchangeRatesItem, error) {
 	if s.cachedRates == nil || !cached {
+		err := isInQuota(s.clientRateLimiters.ExchangeRates)
+		if err != nil {
+			return nil, err
+		}
+
 		rates, err := s.client.ExchangeRates()
 		if err != nil {
 			return nil, err
@@ -195,6 +249,12 @@ func (s *Service) GetGlobalMarketGraphData(convert string, start int64, end int6
 	if convertTo == "" {
 		convertTo = "usd"
 	}
+
+	err := isInQuota(s.clientRateLimiters.GlobalCharts)
+	if err != nil {
+		return ret, err
+	}
+
 	graphData, err := s.client.GlobalCharts("usd", days)
 	if err != nil {
 		return ret, err
@@ -227,6 +287,12 @@ func (s *Service) GetGlobalMarketGraphData(convert string, start int64, end int6
 func (s *Service) GetGlobalMarketData(convert string) (apitypes.GlobalMarketData, error) {
 	convert = strings.ToLower(convert)
 	ret := apitypes.GlobalMarketData{}
+
+	err := isInQuota(s.clientRateLimiters.Global)
+	if err != nil {
+		return ret, err
+	}
+
 	market, err := s.client.Global()
 	if err != nil {
 		return ret, err
@@ -253,6 +319,11 @@ func (s *Service) Price(name string, convert string) (float64, error) {
 	ids := []string{s.coinNameToID(name)}
 	convert = strings.ToLower(convert)
 	currencies := []string{convert}
+
+	err := isInQuota(s.clientRateLimiters.SimplePrice)
+	if err != nil {
+		return 0, err
+	}
 	priceList, err := s.client.SimplePrice(ids, currencies)
 	if err != nil {
 		return 0, err
@@ -332,6 +403,11 @@ func (s *Service) SupportedCurrencies() []string {
 
 // cacheCoinsIDList fetches list of all coin IDS by name and symbols and caches it in a map for fast lookups
 func (s *Service) cacheCoinsIDList() error {
+	err := isInQuota(s.clientRateLimiters.CoinsList)
+	if err != nil {
+		return err
+	}
+
 	list, err := s.client.CoinsList()
 	if err != nil {
 		return err
@@ -402,6 +478,12 @@ func (s *Service) getPaginatedCoinData(convert string, offset int, names []strin
 	for i, name := range names {
 		ids[i] = s.coinNameToID(name)
 	}
+
+	err := isInQuota(s.clientRateLimiters.CoinsMarket)
+	if err != nil {
+		return nil, err
+	}
+
 	list, err := s.client.CoinsMarket(convertTo, ids, order, int(s.maxResultsPerPage), page, sparkline, priceChangePercentage)
 	if err != nil {
 		return nil, err
